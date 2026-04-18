@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image_size", type=int, default=64)
     p.add_argument("--num_points", type=int, default=0, help="0 means infer from template_mesh vertex count")
     p.add_argument("--template_mesh", type=str, default="data/template/sphere_coarse.vtp")
+    p.add_argument("--seg_ids", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7])
     p.add_argument("--label_positive_threshold", type=float, default=0.5)
     p.add_argument("--max_cases_per_split", type=int, default=0, help="0 means use all")
     return p.parse_args()
@@ -61,6 +62,18 @@ def _normalize_ct(ct: np.ndarray) -> np.ndarray:
     mean, std = float(ct.mean()), float(ct.std() + 1e-6)
     ct = (ct - mean) / std
     return ct.astype(np.float32)
+
+
+def _remap_seg_to_dense_labels(seg: np.ndarray) -> np.ndarray:
+    # Some datasets store labels as encoded intensities (e.g., 205, 420, ...).
+    # Remap non-zero unique values to dense IDs 1..K.
+    out = np.zeros_like(seg, dtype=np.int32)
+    vals = np.unique(seg)
+    vals = vals[vals > 0]
+    vals = np.sort(vals)
+    for i, v in enumerate(vals):
+        out[seg == v] = i + 1
+    return out
 
 
 def _extract_surface_mask(mask: np.ndarray) -> np.ndarray:
@@ -101,6 +114,40 @@ def _sample_surface_points(mask: np.ndarray, num_points: int) -> np.ndarray:
     return coords.astype(np.float32)
 
 
+def _normalize_vectors(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    n = np.linalg.norm(x, axis=1, keepdims=True)
+    return x / np.clip(n, eps, None)
+
+
+def _radial_correspondence_points(mask: np.ndarray, template_dirs: np.ndarray, chunk_size: int = 256) -> tuple[np.ndarray, float]:
+    coords = np.argwhere(_extract_surface_mask(mask) > 0).astype(np.float32)
+    if coords.shape[0] < 64:
+        coords = np.argwhere(mask > 0).astype(np.float32)
+    if coords.shape[0] == 0:
+        pts = np.zeros((template_dirs.shape[0], 3), dtype=np.float32)
+        pts += np.random.randn(template_dirs.shape[0], 3).astype(np.float32) * 0.01
+        return pts, 0.0
+
+    center = np.mean(coords, axis=0, keepdims=True)
+    vec = coords - center
+    radii = np.linalg.norm(vec, axis=1, keepdims=True)
+    dirs = _normalize_vectors(vec)
+    r_norm = radii / np.clip(np.max(radii), 1e-6, None)
+
+    selected = np.zeros((template_dirs.shape[0], 3), dtype=np.float32)
+    conf = np.zeros((template_dirs.shape[0],), dtype=np.float32)
+    for i in range(0, template_dirs.shape[0], chunk_size):
+        q = template_dirs[i : i + chunk_size]  # [Q,3]
+        cosine = q @ dirs.T  # [Q,K]
+        score = 0.85 * cosine + 0.15 * r_norm.T
+        idx = np.argmax(score, axis=1)
+        selected[i : i + chunk_size] = vec[idx]
+        conf[i : i + chunk_size] = cosine[np.arange(cosine.shape[0]), idx]
+    scale = np.max(np.linalg.norm(selected, axis=1)) + 1e-6
+    selected = selected / scale
+    return selected.astype(np.float32), float(np.mean(conf))
+
+
 def _pair_cases(image_dir: str, seg_dir: str) -> List[Tuple[str, str, str]]:
     image_files = _scan_nii(image_dir)
     seg_files = _scan_nii(seg_dir)
@@ -122,6 +169,8 @@ def _convert_split(
     out_dir: str,
     image_size: int,
     num_points: int,
+    seg_ids: List[int],
+    template_dirs: np.ndarray,
     threshold: float,
     max_cases: int,
 ) -> None:
@@ -137,11 +186,29 @@ def _convert_split(
         ct = _resize_3d(ct, image_size, mode="image")
         seg = _resize_3d(seg, image_size, mode="label")
         ct = _normalize_ct(ct)
-        mask = (seg > threshold).astype(np.uint8)
-        points = _sample_surface_points(mask, num_points)
+        seg_dense = _remap_seg_to_dense_labels(seg)
+        point_list = []
+        valid_list = []
+        quality_list = []
+        for sid in seg_ids:
+            mask = (seg_dense == int(sid)).astype(np.uint8)
+            points_i, quality_i = _radial_correspondence_points(mask, template_dirs)
+            valid_i = 1.0 if np.sum(mask) > 0 else 0.0
+            point_list.append(points_i)
+            valid_list.append(valid_i)
+            quality_list.append(quality_i)
+        points = np.stack(point_list, axis=0).astype(np.float32)  # [S,N,3]
+        valid = np.asarray(valid_list, dtype=np.float32)  # [S]
 
         out_file = os.path.join(out_dir, f"{cid}.npz")
-        np.savez_compressed(out_file, image=ct[None, ...].astype(np.float32), points=points)
+        np.savez_compressed(
+            out_file,
+            image=ct[None, ...].astype(np.float32),
+            points=points,
+            valid=valid,
+            seg_ids=np.asarray(seg_ids, dtype=np.int32),
+            quality=np.asarray(quality_list, dtype=np.float32),
+        )
 
 
 def main() -> None:
@@ -152,6 +219,12 @@ def main() -> None:
         v_tmplt, _ = load_template_mesh(args.template_mesh)
         args.num_points = int(v_tmplt.shape[0])
         print(f"Auto-set num_points from template '{args.template_mesh}': {args.num_points}")
+    v_tmplt, _ = load_template_mesh(args.template_mesh)
+    template_dirs = _normalize_vectors(v_tmplt.astype(np.float32))
+    if template_dirs.shape[0] != args.num_points:
+        raise ValueError(
+            f"Template vertex count ({template_dirs.shape[0]}) must equal num_points ({args.num_points})."
+        )
     split_cfg = [
         ("train", "ct_train", "ct_train_seg"),
         ("val", "ct_val", "ct_val_seg"),
@@ -165,6 +238,8 @@ def main() -> None:
             out_dir=os.path.join(args.out_root, split),
             image_size=args.image_size,
             num_points=args.num_points,
+            seg_ids=args.seg_ids,
+            template_dirs=template_dirs,
             threshold=args.label_positive_threshold,
             max_cases=args.max_cases_per_split,
         )

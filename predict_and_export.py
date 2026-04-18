@@ -136,6 +136,16 @@ def _prepare_sample(batch: Dict[str, torch.Tensor], device: torch.device) -> Dic
     return {k: v.unsqueeze(0).to(device) for k, v in batch.items()}
 
 
+def _merge_meshes(vertices_s: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # vertices_s: [S,N,3], faces: [F,3]
+    s, n, _ = vertices_s.shape
+    verts = vertices_s.reshape(s * n, 3)
+    faces_all = []
+    for i in range(s):
+        faces_all.append(faces + i * n)
+    return verts, np.concatenate(faces_all, axis=0)
+
+
 def main() -> None:
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -180,6 +190,7 @@ def main() -> None:
     batch = _prepare_sample(ds[idx], device=device)
 
     ckpt_args = ckpt.get("args", {})
+    num_structures = int(ckpt_args.get("num_structures", 1))
     model = MeshDeformNetLite(
         feat_dim=128,
         hidden_dim=128,
@@ -189,12 +200,15 @@ def main() -> None:
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
 
-    init_vertices = torch.from_numpy(template_v).float().to(device).unsqueeze(0)
+    init_vertices = torch.from_numpy(template_v).float().to(device)
+    init_struct = init_vertices.unsqueeze(0).repeat(num_structures, 1, 1).unsqueeze(0)  # [1,S,N,3]
     adj = torch.from_numpy(template_adj).float().to(device).unsqueeze(0)
 
     with torch.no_grad():
-        pred = model(batch["image"], init_vertices, adj)[0].cpu().numpy()
+        pred = model(batch["image"], init_struct, adj)[0].cpu().numpy()  # [S,N,3]
     gt = batch["points"][0].detach().cpu().numpy()
+    if gt.ndim == 2:
+        gt = gt[None, ...]
 
     base = f"{args.prefix}_{args.split}_{idx:03d}"
     pred_ply = os.path.join(args.out_dir, f"{base}_pred_points.ply")
@@ -206,12 +220,31 @@ def main() -> None:
     pred_npy = os.path.join(args.out_dir, f"{base}_pred_vertices.npy")
     gt_npy = os.path.join(args.out_dir, f"{base}_gt_vertices.npy")
 
-    write_pointcloud_ply(pred_ply, pred)
-    write_pointcloud_ply(gt_ply, gt)
-    write_obj_wireframe(pred_wire_obj, pred, template_e)
-    write_obj_wireframe(gt_wire_obj, gt, template_e)
-    write_vtp_wireframe(pred_wire_vtp, pred, template_e)
-    write_vtp_wireframe(gt_wire_vtp, gt, template_e)
+    pred_points = pred.reshape(-1, 3)
+    gt_points = gt.reshape(-1, 3)
+    write_pointcloud_ply(pred_ply, pred_points)
+    write_pointcloud_ply(gt_ply, gt_points)
+    if pred.shape[0] == 1:
+        pred_wire_points = pred[0]
+        gt_wire_points = gt[0]
+    else:
+        pred_wire_points, pred_wire_faces = _merge_meshes(pred, np.zeros((0, 3), dtype=np.int64))
+        gt_wire_points, _ = _merge_meshes(gt, np.zeros((0, 3), dtype=np.int64))
+    if pred.shape[0] == 1:
+        write_obj_wireframe(pred_wire_obj, pred_wire_points, template_e)
+        write_obj_wireframe(gt_wire_obj, gt_wire_points, template_e)
+        write_vtp_wireframe(pred_wire_vtp, pred_wire_points, template_e)
+        write_vtp_wireframe(gt_wire_vtp, gt_wire_points, template_e)
+    else:
+        e_list = []
+        n = pred.shape[1]
+        for i in range(pred.shape[0]):
+            e_list.append(template_e + i * n)
+        edges_cat = np.concatenate(e_list, axis=0)
+        write_obj_wireframe(pred_wire_obj, pred_points, edges_cat)
+        write_obj_wireframe(gt_wire_obj, gt_points, edges_cat)
+        write_vtp_wireframe(pred_wire_vtp, pred_points, edges_cat)
+        write_vtp_wireframe(gt_wire_vtp, gt_points, edges_cat)
     np.save(pred_npy, pred)
     np.save(gt_npy, gt)
 
@@ -233,10 +266,16 @@ def main() -> None:
         gt_mesh_obj = os.path.join(args.out_dir, f"{base}_gt_mesh.obj")
         pred_mesh_vtp = os.path.join(args.out_dir, f"{base}_pred_mesh.vtp")
         gt_mesh_vtp = os.path.join(args.out_dir, f"{base}_gt_mesh.vtp")
-        write_obj_mesh(pred_mesh_obj, pred, faces)
-        write_obj_mesh(gt_mesh_obj, gt, faces)
-        write_vtp_mesh(pred_mesh_vtp, pred, faces)
-        write_vtp_mesh(gt_mesh_vtp, gt, faces)
+        if pred.shape[0] == 1:
+            pred_mesh_pts, pred_mesh_faces = pred[0], faces
+            gt_mesh_pts, gt_mesh_faces = gt[0], faces
+        else:
+            pred_mesh_pts, pred_mesh_faces = _merge_meshes(pred, faces)
+            gt_mesh_pts, gt_mesh_faces = _merge_meshes(gt, faces)
+        write_obj_mesh(pred_mesh_obj, pred_mesh_pts, pred_mesh_faces)
+        write_obj_mesh(gt_mesh_obj, gt_mesh_pts, gt_mesh_faces)
+        write_vtp_mesh(pred_mesh_vtp, pred_mesh_pts, pred_mesh_faces)
+        write_vtp_mesh(gt_mesh_vtp, gt_mesh_pts, gt_mesh_faces)
         print(f"Exported triangle mesh: {pred_mesh_obj}")
         print(f"Exported triangle mesh: {pred_mesh_vtp}")
 

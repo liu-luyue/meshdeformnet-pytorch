@@ -69,12 +69,18 @@ class MeshDeformNetLite(nn.Module):
         init_vertices: torch.Tensor,
         adj: torch.Tensor,
     ) -> torch.Tensor:
-        # image: [B,1,D,H,W], init_vertices: [B,N,3], adj: [B,N,N]
+        # image: [B,1,D,H,W], init_vertices: [B,S,N,3] (or [B,N,3]), adj: [B,N,N]
+        if init_vertices.ndim == 3:
+            init_vertices = init_vertices.unsqueeze(1)
+        bsz, num_struct, num_vertices, _ = init_vertices.shape
         g = self.encoder(image)  # [B,F]
-        g = g.unsqueeze(1).expand(-1, init_vertices.shape[1], -1)  # [B,N,F]
-        x = torch.cat([init_vertices, g], dim=-1)
+        g = g.unsqueeze(1).unsqueeze(1).expand(-1, num_struct, num_vertices, -1)  # [B,S,N,F]
+        x = torch.cat([init_vertices, g], dim=-1)  # [B,S,N,3+F]
+        x = x.reshape(bsz * num_struct, num_vertices, -1)
+        adj = adj.unsqueeze(1).expand(-1, num_struct, -1, -1).reshape(bsz * num_struct, num_vertices, num_vertices)
         x = F.relu(self.input_proj(x))
         for blk in self.blocks:
             x = blk(x, adj)
         delta = self.delta_head(x) * self.delta_scale
-        return init_vertices + delta
+        out = init_vertices.reshape(bsz * num_struct, num_vertices, 3) + delta
+        return out.reshape(bsz, num_struct, num_vertices, 3)

@@ -30,9 +30,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--delta_scale", type=float, default=0.2)
+    p.add_argument("--num_structures", type=int, default=7)
     p.add_argument("--w_chamfer", type=float, default=1.0)
     p.add_argument("--w_edge", type=float, default=0.1)
-    p.add_argument("--w_lap", type=float, default=0.1)
+    p.add_argument("--w_lap", type=float, default=0.05)
+    p.add_argument("--w_normal", type=float, default=0.2)
     p.add_argument("--save_dir", type=str, default="runs/lite")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -45,8 +47,9 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
 def evaluate(
     model: MeshDeformNetLite,
     loader: DataLoader,
-    init_vertices: torch.Tensor,
+    init_struct: torch.Tensor,
     edges: torch.Tensor,
+    faces: torch.Tensor,
     adj: torch.Tensor,
     args: argparse.Namespace,
     device: torch.device,
@@ -58,7 +61,8 @@ def evaluate(
         for batch in loader:
             batch = move_batch_to_device(batch, device)
             b = batch["image"].shape[0]
-            init_b = init_vertices.unsqueeze(0).expand(b, -1, -1)
+            valid = batch["valid"]
+            init_b = init_struct.unsqueeze(0).expand(b, -1, -1, -1)
             adj_b = adj.unsqueeze(0).expand(b, -1, -1)
             pred = model(batch["image"], init_b, adj_b)
             losses = geometric_loss(
@@ -66,9 +70,12 @@ def evaluate(
                 batch["points"],
                 edges=edges,
                 adj=adj_b,
+                faces=faces,
+                valid=valid,
                 w_chamfer=args.w_chamfer,
                 w_edge=args.w_edge,
                 w_lap=args.w_lap,
+                w_normal=args.w_normal,
             )
             total += float(losses["total"].item()) * b
             n += b
@@ -89,13 +96,16 @@ def main() -> None:
         template_f = np.zeros((0, 3), dtype=np.int64)
     init_vertices = torch.from_numpy(template_v).float().to(device)
     edges = torch.from_numpy(template_e).long().to(device)
+    faces = torch.from_numpy(template_f).long().to(device)
     adj = torch.from_numpy(template_adj).float().to(device)
+    init_struct = init_vertices.unsqueeze(0).repeat(args.num_structures, 1, 1)
 
     datasets = build_datasets(
         data_mode=args.data_mode,
         image_size=args.image_size,
         num_vertices=args.num_vertices,
         template_vertices=template_v,
+        num_structures=args.num_structures,
         train_dir=args.train_dir if args.train_dir else None,
         val_dir=args.val_dir if args.val_dir else None,
     )
@@ -118,7 +128,8 @@ def main() -> None:
         for batch in pbar:
             batch = move_batch_to_device(batch, device)
             b = batch["image"].shape[0]
-            init_b = init_vertices.unsqueeze(0).expand(b, -1, -1)
+            valid = batch["valid"]
+            init_b = init_struct.unsqueeze(0).expand(b, -1, -1, -1)
             adj_b = adj.unsqueeze(0).expand(b, -1, -1)
 
             pred = model(batch["image"], init_b, adj_b)
@@ -127,9 +138,12 @@ def main() -> None:
                 batch["points"],
                 edges=edges,
                 adj=adj_b,
+                faces=faces,
+                valid=valid,
                 w_chamfer=args.w_chamfer,
                 w_edge=args.w_edge,
                 w_lap=args.w_lap,
+                w_normal=args.w_normal,
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -143,10 +157,11 @@ def main() -> None:
                 ch=f"{losses['chamfer'].item():.4f}",
                 edge=f"{losses['edge'].item():.4f}",
                 lap=f"{losses['lap'].item():.4f}",
+                normal=f"{losses['normal'].item():.4f}",
             )
 
         train_total = train_total_sum / max(1, train_n)
-        val_loss = evaluate(model, val_loader, init_vertices, edges, adj, args, device)
+        val_loss = evaluate(model, val_loader, init_struct, edges, faces, adj, args, device)
         print(f"[Epoch {epoch}] train_total={train_total:.6f} val_total={val_loss:.6f}")
 
         ckpt_last = os.path.join(args.save_dir, "last.pt")
